@@ -13,9 +13,12 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -31,6 +34,7 @@
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "test/util/cleanup.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
 #include "test/util/memory_util.h"
@@ -159,6 +163,60 @@ TEST(ProcPidSmapsTest, SharedReadOnlyFile) {
     EXPECT_THAT(entry.vm_flags.value(), Not(Contains("sh")));
     EXPECT_THAT(entry.vm_flags.value(), Not(Contains("mw")));
   }
+}
+
+// Pages that a forked child shares with its parent are Shared_Dirty in both
+// until the parent writes them, breaking copy-on-write. gVisor may copy more
+// than the written pages, so only lower bounds are checked on the pages that
+// become private.
+TEST(ProcPidSmapsTest, ForkCopyOnWrite) {
+  constexpr size_t kPages = 16;
+  constexpr size_t kWrittenPages = 4;
+  // PROT_NONE guard pages on either side keep the tested vma from merging with
+  // neighbouring mappings.
+  Mapping const guarded = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon((kPages + 2) * kPageSize, PROT_NONE, MAP_PRIVATE));
+  uintptr_t const addr = guarded.addr() + kPageSize;
+  ASSERT_THAT(mprotect(reinterpret_cast<void*>(addr), kPages * kPageSize,
+                       PROT_READ | PROT_WRITE),
+              SyscallSucceeds());
+  memset(reinterpret_cast<void*>(addr), 'a', kPages * kPageSize);
+
+  pid_t const child = fork();
+  if (child == 0) {
+    while (true) {
+      pause();
+    }
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  auto cleanup = Cleanup([child] {
+    EXPECT_THAT(kill(child, SIGKILL), SyscallSucceeds());
+    EXPECT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+
+  size_t const kAllKB = kPages * kPageSize / 1024;
+  size_t const kWrittenKB = kWrittenPages * kPageSize / 1024;
+  auto const before = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+      ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_LE(before.rss_kb, kAllKB);
+  EXPECT_EQ(before.shared_dirty_kb, before.rss_kb);
+  EXPECT_EQ(before.private_dirty_kb, 0);
+
+  memset(reinterpret_cast<void*>(addr), 'b', kWrittenPages * kPageSize);
+
+  auto const child_after = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+      ASSERT_NO_ERRNO_AND_VALUE(ReadProcSmaps(child)), addr));
+  EXPECT_LE(child_after.rss_kb, kAllKB);
+  EXPECT_EQ(child_after.shared_dirty_kb + child_after.private_dirty_kb,
+            child_after.rss_kb);
+  EXPECT_GE(child_after.private_dirty_kb, kWrittenKB);
+
+  auto const parent_after = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueSmapsEntry(
+      ASSERT_NO_ERRNO_AND_VALUE(ReadProcSelfSmaps()), addr));
+  EXPECT_LE(parent_after.rss_kb, kAllKB);
+  EXPECT_EQ(parent_after.shared_dirty_kb, child_after.shared_dirty_kb);
+  EXPECT_GE(parent_after.private_dirty_kb, kWrittenKB);
 }
 
 // Tests that gVisor's /proc/[pid]/smaps provides all of the fields we expect it

@@ -1227,6 +1227,31 @@ func (f *MemoryFile) FirstSharedRange(fr memmap.FileRange) (memmap.FileRange, bo
 	return sr, sr.Length() != 0
 }
 
+// SharedBytes returns the number of bytes in fr on which more than one
+// reference is held. As for HasUniqueRef, the result is racy unless the caller
+// prevents other goroutines from copying fr.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) SharedBytes(fr memmap.FileRange) uint64 {
+	var n uint64
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+		unfree := &f.unfreeSmall
+		if chunk.huge {
+			unfree = &f.unfreeHuge
+		}
+		unfree.VisitFullRange(chunkFR, func(ufseg unfreeIterator) bool {
+			if ufseg.ValuePtr().refs > 1 {
+				n += ufseg.Range().Intersect(chunkFR).Length()
+			}
+			return true
+		})
+		return true
+	})
+	return n
+}
+
 // IncRef implements memmap.File.IncRef.
 func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
