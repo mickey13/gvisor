@@ -2132,6 +2132,91 @@ TEST(ProcPidStatusTest, ValuesAreTabDelimited) {
   }
 }
 
+// Returns the first and third fields of a schedstat file: nanoseconds run and
+// timeslices run.
+PosixErrorOr<std::pair<uint64_t, uint64_t>> ReadSchedstat(
+    const std::string& path) {
+  ASSIGN_OR_RETURN_ERRNO(std::string contents, GetContents(path));
+  std::vector<std::string> fields =
+      absl::StrSplit(absl::StripAsciiWhitespace(contents), ' ');
+  uint64_t run, wait, count;
+  if (fields.size() != 3 || !absl::SimpleAtoi(fields[0], &run) ||
+      !absl::SimpleAtoi(fields[1], &wait) ||
+      !absl::SimpleAtoi(fields[2], &count)) {
+    return PosixError(EINVAL, absl::StrCat("bad ", path, ": ", contents));
+  }
+  return std::make_pair(run, count);
+}
+
+// Spins until the calling thread has used `cpu` of CPU time.
+void SpinFor(absl::Duration cpu) {
+  struct timespec ts;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  const absl::Duration end = absl::DurationFromTimespec(ts) + cpu;
+  do {
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  } while (absl::DurationFromTimespec(ts) < end);
+}
+
+absl::Duration Monotonic() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return absl::DurationFromTimespec(ts);
+}
+
+TEST(ProcPidSchedstat, CountsRunningNotSleeping) {
+  const DisableSave ds;
+  const std::string path =
+      absl::StrCat("/proc/self/task/", syscall(SYS_gettid), "/schedstat");
+
+  const absl::Duration wall0 = Monotonic();
+  auto before = ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat(path));
+  SpinFor(absl::Milliseconds(50));
+  auto after = ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat(path));
+  const absl::Duration wall = Monotonic() - wall0;
+  const absl::Duration ran = absl::Nanoseconds(after.first - before.first);
+  EXPECT_GE(ran, absl::Milliseconds(40));
+  EXPECT_LE(ran, wall + absl::Milliseconds(1));
+
+  before = after;
+  absl::SleepFor(absl::Milliseconds(100));
+  after = ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat(path));
+  EXPECT_LT(absl::Nanoseconds(after.first - before.first),
+            absl::Milliseconds(20));
+  EXPECT_GT(after.second, before.second);
+}
+
+// /proc/[pid]/schedstat describes the thread group leader alone, and
+// /proc/[pid]/task/[tid]/schedstat each thread.
+TEST(ProcPidSchedstat, PerThread) {
+  const DisableSave ds;
+  std::atomic<pid_t> sleeper_tid = 0;
+  absl::Notification done;
+  ScopedThread sleeper([&] {
+    sleeper_tid = syscall(SYS_gettid);
+    done.WaitForNotification();
+  });
+  while (sleeper_tid == 0) {
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  const std::string sleeper_path =
+      absl::StrCat("/proc/self/task/", sleeper_tid.load(), "/schedstat");
+
+  auto leader_before =
+      ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat("/proc/self/schedstat"));
+  auto sleeper_before = ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat(sleeper_path));
+  SpinFor(absl::Milliseconds(50));
+  auto leader_after =
+      ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat("/proc/self/schedstat"));
+  auto sleeper_after = ASSERT_NO_ERRNO_AND_VALUE(ReadSchedstat(sleeper_path));
+  done.Notify();
+
+  EXPECT_GE(absl::Nanoseconds(leader_after.first - leader_before.first),
+            absl::Milliseconds(40));
+  EXPECT_LT(absl::Nanoseconds(sleeper_after.first - sleeper_before.first),
+            absl::Milliseconds(20));
+}
+
 // Threads properly counts running threads.
 //
 // TODO(mpratt): Test zombied threads while the thread group leader is still
