@@ -102,3 +102,59 @@ func TestAddressDispatcherExpiredToAssigned(t *testing.T) {
 		t.Fatalf("expect to observe address added: %s", err)
 	}
 }
+
+func TestAcquireAssignedAddressOrMatchingSkipsHostAddresses(t *testing.T) {
+	var networkEp fakeNetworkEndpoint
+	if err := networkEp.Enable(); err != nil {
+		t.Fatalf("ep.Enable(): %s", err)
+	}
+
+	var s stack.AddressableEndpointState
+	s.Init(&networkEp, stack.AddressableEndpointStateOptions{HiddenWhileDisabled: false})
+
+	hostAddr := tcpip.AddressWithPrefix{
+		Address:   tcpip.AddrFrom4([4]byte{192, 0, 2, 1}),
+		PrefixLen: 32,
+	}
+	subnetAddr := tcpip.AddressWithPrefix{
+		Address:   tcpip.AddrFrom4([4]byte{192, 0, 2, 2}),
+		PrefixLen: 24,
+	}
+	broadcastAddr := tcpip.AddrFrom4([4]byte{192, 0, 2, 255})
+
+	calls := 0
+	isBroadcast := func(ep stack.AddressEndpoint) bool {
+		calls++
+		subnet := ep.Subnet()
+		return subnet.IsBroadcast(broadcastAddr)
+	}
+	acquire := func() stack.AddressEndpoint {
+		calls = 0
+		return s.AcquireAssignedAddressOrMatching(broadcastAddr, isBroadcast, false /* allowTemp */, stack.NeverPrimaryEndpoint, true /* readOnly */)
+	}
+
+	ep, err := s.AddAndAcquirePermanentAddress(hostAddr, stack.AddressProperties{})
+	if err != nil {
+		t.Fatalf("s.AddAndAcquirePermanentAddress(%s, {}): %s", hostAddr, err)
+	}
+	ep.DecRef()
+	if ep := acquire(); ep != nil || calls != 0 {
+		t.Fatalf("got s.AcquireAssignedAddressOrMatching(%s, ...) = %v after %d matcher calls, want = nil after 0 calls", broadcastAddr, ep, calls)
+	}
+
+	ep, err = s.AddAndAcquirePermanentAddress(subnetAddr, stack.AddressProperties{})
+	if err != nil {
+		t.Fatalf("s.AddAndAcquirePermanentAddress(%s, {}): %s", subnetAddr, err)
+	}
+	ep.DecRef()
+	if ep := acquire(); ep == nil || ep.AddressWithPrefix() != subnetAddr || calls != 1 {
+		t.Fatalf("got s.AcquireAssignedAddressOrMatching(%s, ...) = %v after %d matcher calls, want = %s after 1 call", broadcastAddr, ep, calls, subnetAddr)
+	}
+
+	if err := s.RemovePermanentAddress(subnetAddr.Address); err != nil {
+		t.Fatalf("s.RemovePermanentAddress(%s): %s", subnetAddr.Address, err)
+	}
+	if ep := acquire(); ep != nil || calls != 0 {
+		t.Fatalf("got s.AcquireAssignedAddressOrMatching(%s, ...) = %v after %d matcher calls, want = nil after 0 calls", broadcastAddr, ep, calls)
+	}
+}
