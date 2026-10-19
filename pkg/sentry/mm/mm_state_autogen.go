@@ -221,7 +221,9 @@ func (mm *MemoryManager) StateFields() []string {
 		"curRSS",
 		"maxRSS",
 		"hasPinned",
+		"gsInUse",
 		"dumpability",
+		"userNS",
 		"argv",
 		"envv",
 		"auxv",
@@ -254,15 +256,17 @@ func (mm *MemoryManager) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(10, &mm.curRSS)
 	stateSinkObject.Save(11, &mm.maxRSS)
 	stateSinkObject.Save(12, &mm.hasPinned)
-	stateSinkObject.Save(13, &mm.dumpability)
-	stateSinkObject.Save(14, &mm.argv)
-	stateSinkObject.Save(15, &mm.envv)
-	stateSinkObject.Save(16, &mm.auxv)
-	stateSinkObject.Save(17, &mm.executable)
-	stateSinkObject.Save(18, &mm.aioManager)
-	stateSinkObject.Save(19, &mm.vdsoSigReturnAddr)
-	stateSinkObject.Save(20, &mm.membarrierPrivateEnabled)
-	stateSinkObject.Save(21, &mm.membarrierRSeqEnabled)
+	stateSinkObject.Save(13, &mm.gsInUse)
+	stateSinkObject.Save(14, &mm.dumpability)
+	stateSinkObject.Save(15, &mm.userNS)
+	stateSinkObject.Save(16, &mm.argv)
+	stateSinkObject.Save(17, &mm.envv)
+	stateSinkObject.Save(18, &mm.auxv)
+	stateSinkObject.Save(19, &mm.executable)
+	stateSinkObject.Save(20, &mm.aioManager)
+	stateSinkObject.Save(21, &mm.vdsoSigReturnAddr)
+	stateSinkObject.Save(22, &mm.membarrierPrivateEnabled)
+	stateSinkObject.Save(23, &mm.membarrierRSeqEnabled)
 }
 
 // +checklocksignore
@@ -280,15 +284,17 @@ func (mm *MemoryManager) StateLoad(ctx context.Context, stateSourceObject state.
 	stateSourceObject.Load(10, &mm.curRSS)
 	stateSourceObject.Load(11, &mm.maxRSS)
 	stateSourceObject.Load(12, &mm.hasPinned)
-	stateSourceObject.Load(13, &mm.dumpability)
-	stateSourceObject.Load(14, &mm.argv)
-	stateSourceObject.Load(15, &mm.envv)
-	stateSourceObject.Load(16, &mm.auxv)
-	stateSourceObject.Load(17, &mm.executable)
-	stateSourceObject.Load(18, &mm.aioManager)
-	stateSourceObject.Load(19, &mm.vdsoSigReturnAddr)
-	stateSourceObject.Load(20, &mm.membarrierPrivateEnabled)
-	stateSourceObject.Load(21, &mm.membarrierRSeqEnabled)
+	stateSourceObject.Load(13, &mm.gsInUse)
+	stateSourceObject.Load(14, &mm.dumpability)
+	stateSourceObject.Load(15, &mm.userNS)
+	stateSourceObject.Load(16, &mm.argv)
+	stateSourceObject.Load(17, &mm.envv)
+	stateSourceObject.Load(18, &mm.auxv)
+	stateSourceObject.Load(19, &mm.executable)
+	stateSourceObject.Load(20, &mm.aioManager)
+	stateSourceObject.Load(21, &mm.vdsoSigReturnAddr)
+	stateSourceObject.Load(22, &mm.membarrierPrivateEnabled)
+	stateSourceObject.Load(23, &mm.membarrierRSeqEnabled)
 	stateSourceObject.AfterLoad(func() { mm.afterLoad(ctx) })
 }
 

@@ -77,19 +77,6 @@ var (
 	globalErr  error
 )
 
-// OpenDevice opens the KVM device and returns the File.
-// If the devicePath is empty, it will default to /dev/kvm.
-func OpenDevice(devicePath string) (*fd.FD, error) {
-	if devicePath == "" {
-		devicePath = "/dev/kvm"
-	}
-	f, err := fd.Open(devicePath, unix.O_RDWR, 0)
-	if err != nil {
-		return nil, fmt.Errorf("error opening KVM device file (%s): %v", devicePath, err)
-	}
-	return f, nil
-}
-
 // New returns a new KVM-based implementation of the platform interface.
 func New(deviceFile *fd.FD, config Config) (*KVM, error) {
 	if hostPageSize := unix.Getpagesize(); hostPageSize != hostarch.PageSize {
@@ -172,7 +159,7 @@ func (*KVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace() (platform.AddressSpace, error) {
+func (k *KVM) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 
@@ -244,15 +231,6 @@ func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 		StartupTimer:     opts.StartupTimer,
 		PinRing:          opts.PinRing,
 	})
-}
-
-func (*constructor) OpenDevice(devicePath string) (*fd.FD, error) {
-	return OpenDevice(devicePath)
-}
-
-// Flags implements platform.Constructor.Flags().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{}
 }
 
 func init() {
