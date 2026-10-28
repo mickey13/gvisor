@@ -332,7 +332,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					// hugepage-backed, the caller won't commit every allocated
 					// page since hugeMaskAR is ar expanded to huge alignment,
 					// unless only one page in optAR falls into the huge page.
-					if callerIndirectCommit && (huge || allocAR.Length() == hostarch.PageSize) {
+					if callerIndirectCommit && (huge || allocAR.Length() == hostarch.Addr(hostarch.PageSize)) {
 						allocOpts.Mode = pgalloc.AllocateCallerIndirectCommit
 					}
 					fr, err := mm.mf.Allocate(uint64(allocAR.Length()), allocOpts)
@@ -452,10 +452,10 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						// being able to do much. So only copy up to one page
 						// before and after the pages required.
 						stackMaskAR := ar
-						if newStart := stackMaskAR.Start - hostarch.PageSize; newStart < stackMaskAR.Start {
+						if newStart := stackMaskAR.Start - hostarch.Addr(hostarch.PageSize); newStart < stackMaskAR.Start {
 							stackMaskAR.Start = newStart
 						}
-						if newEnd := stackMaskAR.End + hostarch.PageSize; newEnd > stackMaskAR.End {
+						if newEnd := stackMaskAR.End + hostarch.Addr(hostarch.PageSize); newEnd > stackMaskAR.End {
 							stackMaskAR.End = newEnd
 						}
 						copyAR = pseg.Range().Intersect(stackMaskAR)
@@ -465,12 +465,13 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						copyAR = pseg.Range().Intersect(hugeMaskAR)
 					}
 					// Get internal mappings from the pma to copy from.
-					if err := pseg.getInternalMappingsLocked(); err != nil {
+					ims, err := pseg.getInternalMappingsLocked(copyAR)
+					if err != nil {
 						return pstart, pseg.PrevGap(), err
 					}
 					// Copy contents.
 					huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
-					reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(pseg, copyAR)}
+					reader := safemem.BlockSeqReader{Blocks: ims}
 					fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
 						Kind:       usage.Anonymous,
 						MemCgID:    memCgID,
@@ -1041,12 +1042,18 @@ func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pm
 	return mm.pmas.UpperBoundSegment(addr)
 }
 
-// getInternalMappingsLocked ensures that pseg.ValuePtr().internalMappings is
-// non-empty. The generated iterator identifies a set node and index, not its
-// MemoryManager, so checklocks cannot name the owning mutex.
+// getInternalMappingsLocked returns internal mappings for addresses in ar.
+// Unless async page loading is in progress and the pma is larger than
+// `asyncLoadMapUnit`, it caches internal mappings for the whole pma in
+// pseg.ValuePtr().internalMappings. The generated iterator
+// identifies a set node and index, not its MemoryManager, so checklocks cannot
+// name the owning mutex.
 //
-// Preconditions: the owning MemoryManager's activeMu is held for writing.
-func (pseg pmaIterator) getInternalMappingsLocked() error {
+// Preconditions:
+//   - The owning MemoryManager's activeMu is held for writing.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length() != 0.
+func (pseg pmaIterator) getInternalMappingsLocked(ar hostarch.AddrRange) (safemem.BlockSeq, error) {
 	pma := pseg.ValuePtr()
 	if pma.internalMappings.IsEmpty() {
 		// This must use maxPerms (instead of perms) because some permission
@@ -1056,13 +1063,16 @@ func (pseg pmaIterator) getInternalMappingsLocked() error {
 		perms := pma.maxPerms
 		// We will never execute application code through an internal mapping.
 		perms.Execute = false
+		if mf, ok := pma.file.(*pgalloc.MemoryFile); ok && mf.IsAsyncLoading() && pseg.Range().Length() > asyncLoadMapUnit {
+			return mf.MapInternal(pseg.fileRangeOf(ar), perms)
+		}
 		ims, err := pma.file.MapInternal(pseg.fileRange(), perms)
 		if err != nil {
-			return err
+			return safemem.BlockSeq{}, err
 		}
 		pma.internalMappings = ims
 	}
-	return nil
+	return pma.internalMappings.DropFirst64(uint64(ar.Start - pseg.Start())).TakeFirst64(uint64(ar.Length())), nil
 }
 
 func (pseg pmaIterator) fileRange() memmap.FileRange {

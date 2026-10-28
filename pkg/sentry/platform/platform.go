@@ -22,7 +22,6 @@ import (
 	"sort"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -72,7 +71,7 @@ type Platform interface {
 	MaxUserAddress() hostarch.Addr
 
 	// NewAddressSpace returns a new memory context for this platform.
-	NewAddressSpace() (AddressSpace, error)
+	NewAddressSpace(opts AddressSpaceOptions) (AddressSpace, error)
 
 	// NewContext returns a new execution context.
 	NewContext(context.Context) Context
@@ -119,6 +118,18 @@ type Platform interface {
 
 	// NumCPUs returns the number of CPUs on the platform.
 	NumCPUs() int
+}
+
+// TSCAdjustablePlatform is an optional interface that may be implemented by a
+// Platform that applies an offset to the guest TSC.
+type TSCAdjustablePlatform interface {
+	// TSCOffset returns the offset the platform applies to the guest TSC,
+	// as a two's-complement value in host TSC cycles.
+	TSCOffset() uint64
+
+	// TSCFrequency returns the frequency in Hz at which the host TSC
+	// advances, and whether the platform was able to determine it.
+	TSCFrequency() (uint64, bool)
 }
 
 // NoCPUPreemptionDetection implements Platform.DetectsCPUPreemption and
@@ -198,7 +209,7 @@ func (u UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
 // MemoryManager represents an abstraction above the platform address space
 // which manages memory mappings and their contents.
 type MemoryManager interface {
-	//usermem.IO provides access to the contents of a virtual memory space.
+	// usermem.IO provides access to the contents of a virtual memory space.
 	usermem.IO
 	// MMap establishes a memory mapping.
 	MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error)
@@ -395,10 +406,26 @@ type AddressSpace interface {
 	// PostFork() is called after creating a copy of AddressSpace.
 	PostFork()
 
+	// UserModifiedGS notifies the address space that the user has modified the GS
+	// register.
+	UserModifiedGS(ctx context.Context, mm MemoryManager) error
+
 	// AddressSpaceIO methods are supported iff the associated platform's
 	// Platform.SupportsAddressSpaceIO() == true. AddressSpaces for which this
 	// does not hold may panic if AddressSpaceIO methods are invoked.
 	AddressSpaceIO
+}
+
+// AddressSpaceOptions contains options for Platform.NewAddressSpace.
+type AddressSpaceOptions struct {
+	// DisableSyscallPatching is used by systrap to indicate that the platform must not patch
+	// application syscall instructions in this address space.
+	//
+	// It is set when the application in the corresponding MemoryManager has
+	// decided to use the GS register, meaning we can no longer patch system calls.
+	// Since a MemoryManager acquires a fresh AddressSpace on fork() and after
+	// restore, it must be initialized to match the parent's state.
+	DisableSyscallPatching bool
 }
 
 // AddressSpaceIO supports IO through the memory mappings installed in an
@@ -496,17 +523,6 @@ type AddressSpaceIOUnavailable struct{}
 // Error implements error.Error.
 func (AddressSpaceIOUnavailable) Error() string {
 	return "platform.AddressSpaceIO currently unavailable"
-}
-
-// Requirements is used to specify platform specific requirements.
-type Requirements struct {
-	// RequiresCapSysPtrace indicates that the sandbox has to be started with
-	// the CAP_SYS_PTRACE capability.
-	RequiresCapSysPtrace bool
-
-	// FrequentHostThreadWakeups indicates that the platform wakes sleeping
-	// host threads at a very high rate.
-	FrequentHostThreadWakeups bool
 }
 
 // SeccompInfo represents seccomp-bpf data for a given platform.
@@ -620,6 +636,9 @@ type Options struct {
 	// It allows releasing them asynchronously.
 	// See `//pkg/pinring`.
 	PinRing *pinring.PinRing
+
+	// TSCOffset is an offset to apply to the guest TSC counter (currently KVM only).
+	TSCOffset uint64
 }
 
 // Constructor represents a platform type.
@@ -630,14 +649,6 @@ type Constructor interface {
 	//
 	//	* opts - Platform customization bits.
 	New(opts Options) (Platform, error)
-
-	// OpenDevice opens the path to the device used by the platform.
-	// Passing in an empty string will use the default path for the device,
-	// e.g. "/dev/kvm" for the KVM platform.
-	OpenDevice(devicePath string) (*fd.FD, error)
-
-	// Requirements returns platform specific requirements.
-	Requirements() Requirements
 
 	// PrecompiledSeccompInfo returns a list of `SeccompInfo`s that is
 	// useful to precompile into the Sentry.

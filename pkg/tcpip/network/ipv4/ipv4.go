@@ -16,6 +16,7 @@
 package ipv4
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"reflect"
@@ -81,6 +82,7 @@ var _ stack.MulticastForwardingNetworkEndpoint = (*endpoint)(nil)
 var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
 var _ stack.AddressableEndpoint = (*endpoint)(nil)
 var _ stack.NetworkEndpoint = (*endpoint)(nil)
+var _ stack.RestorableNetworkEndpoint = (*endpoint)(nil)
 var _ IGMPEndpoint = (*endpoint)(nil)
 
 // +checklocksalias:igmp.ep.mu=mu
@@ -111,6 +113,17 @@ type endpoint struct {
 
 	// +checklocks:mu
 	igmp igmpState
+}
+
+// Restore implements stack.RestorableNetworkEndpoint.
+func (e *endpoint) Restore() {
+	e.mu.Lock()
+	e.igmp.restore()
+	e.mu.Unlock()
+
+	e.protocol.mu.Lock()
+	e.protocol.eps[e.nic.ID()] = e
+	e.protocol.mu.Unlock()
 }
 
 // SetIGMPVersion implements IGMPEndpoint.
@@ -520,8 +533,9 @@ func (e *endpoint) handleFragments(_ *stack.Route, networkMTU uint32, pkt *stack
 	}
 }
 
-// recalculateChecksum recalculates the checksum of a TCP packet.
-func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
+// recalculateChecksum recalculates the transport checksum from the packet's
+// network header.
+func recalculateChecksum(pkt *stack.PacketBuffer) tcpip.Error {
 	// RXChecksumValidated indicates that checksum verification may be
 	// safely skipped.
 	if pkt.RXChecksumValidated {
@@ -540,7 +554,7 @@ func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
 			return &tcpip.ErrMalformedHeader{}
 		}
 		tcp := header.TCP(transportHeader)
-		xsum := r.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.PayloadLength())
+		xsum := header.PseudoHeaderChecksum(header.TCPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), netHdr.PayloadLength())
 		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
 		tcp.SetChecksum(0)
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
@@ -549,7 +563,7 @@ func recalculateChecksum(pkt *stack.PacketBuffer, r *stack.Route) tcpip.Error {
 			return &tcpip.ErrMalformedHeader{}
 		}
 		udp := header.UDP(transportHeader)
-		xsum := r.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.PayloadLength())
+		xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, netHdr.SourceAddress(), netHdr.DestinationAddress(), netHdr.PayloadLength())
 		xsum = checksum.Combine(xsum, pkt.Data().Checksum())
 		udp.SetChecksum(0)
 		csum := ^udp.CalculateChecksum(xsum)
@@ -612,10 +626,10 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Er
 			return nil
 		}
 
-		// Similar to the `ip_route_me_harder` in the kernel,
-		// we need to find a new route for the packet.
-		// Implementation is similar to the func forwardUnicastPacket.
-		newRoute, err := stk.FindRoute(0 /* nic id */, netHeader.SourceAddress(), newDstAddr, header.IPv4ProtocolNumber, false /* multicastLoop */)
+		// Find a new route for the rewritten destination, like Linux
+		// ip_route_me_harder. As there, the packet's source address does not
+		// restrict the route and is left unchanged.
+		newRoute, err := stk.FindRoute(0 /* nic id */, tcpip.Address{} /* localAddr */, newDstAddr, header.IPv4ProtocolNumber, false /* multicastLoop */)
 		if err != nil {
 			e.stats.ip.OutgoingPacketErrors.Increment()
 			return err // Drop the packet
@@ -628,7 +642,7 @@ func (e *endpoint) writePacket(r *stack.Route, pkt *stack.PacketBuffer) tcpip.Er
 		// we must calculate the full checksum; otherwise, NAT should have already
 		// done it.
 		if !r.RequiresTXTransportChecksum() && newRoute.RequiresTXTransportChecksum() {
-			if err := recalculateChecksum(pkt, newRoute); err != nil {
+			if err := recalculateChecksum(pkt); err != nil {
 				e.stats.ip.OutgoingPacketErrors.Increment()
 				return err // Drop the packet
 			}
@@ -1015,6 +1029,11 @@ func (e *endpoint) HandlePacket(pkt *stack.PacketBuffer) {
 func (e *endpoint) handleLocalPacket(pkt *stack.PacketBuffer, canSkipRXChecksum bool) {
 	stats := e.stats.ip
 	stats.PacketsReceived.Increment()
+
+	if !e.isEnabled() {
+		stats.DisabledPacketsReceived.Increment()
+		return
+	}
 
 	pkt = pkt.CloneToInbound()
 	defer pkt.DecRef()
@@ -1653,7 +1672,7 @@ type protocol struct {
 	// eps is keyed by NICID to allow protocol methods to retrieve an endpoint
 	// when handling a packet, by looking at which NIC handled the packet.
 	// +checklocks:mu
-	eps map[tcpip.NICID]*endpoint
+	eps map[tcpip.NICID]*endpoint `state:"nosave"`
 
 	// ICMP types for which the stack's global rate limiting must apply.
 	// +checklocks:mu
@@ -1683,6 +1702,15 @@ type protocol struct {
 	// that multicast packets will only be forwarded if this is non-nil.
 	// +checklocks:mu
 	multicastForwardingDisp stack.MulticastForwardingEventDispatcher
+}
+
+// afterLoad is invoked by stateify.
+//
+// +checklocksexclude:p.mu
+func (p *protocol) afterLoad(context.Context) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.eps = make(map[tcpip.NICID]*endpoint)
 }
 
 // Number returns the ipv4 protocol number.

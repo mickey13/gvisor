@@ -59,10 +59,9 @@ import (
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -294,8 +293,8 @@ func New(opts platform.Options) (*Systrap, error) {
 	if maxSysmsgThreads == 0 {
 		// CPUID information has been initialized at this point.
 		archState.Init()
-		// GOMAXPROCS has been set at this point.
-		maxSysmsgThreads = runtime.GOMAXPROCS(0)
+		// Base GOMAXPROCS has been set at this point.
+		maxSysmsgThreads = gomaxprocs.Base()
 		// Account for syscall thread.
 		maxChildThreads = maxSysmsgThreads + 1
 	}
@@ -313,7 +312,7 @@ func New(opts platform.Options) (*Systrap, error) {
 		configureSystrapAddressSpace()
 		// Don't use sentry and stub fast paths if here is just one cpu,
 		// or if the fast path has been explicitly disabled.
-		neverEnableFastPath = opts.DisableFastPath || min(runtime.NumCPU(), runtime.GOMAXPROCS(0)) == 1
+		neverEnableFastPath = opts.DisableFastPath || min(runtime.NumCPU(), gomaxprocs.Base()) == 1
 
 		// Convert the spin/deep-sleep timeouts into cputicks() units for
 		// the current architecture. Must happen before stubInit(), which
@@ -326,7 +325,8 @@ func New(opts platform.Options) (*Systrap, error) {
 
 		// Create the source process for the global pool. This must be
 		// done before initializing any other processes.
-		source, err := newSubprocess(createStub, mf, false)
+		usesSeccompNotify := false
+		source, err := newSubprocess(createStub, mf, usesSeccompNotify, disableSyscallPatching)
 		if err != nil {
 			stubErr = fmt.Errorf("initialize systrap: %w", err)
 			return
@@ -380,8 +380,22 @@ func (*Systrap) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *Systrap) NewAddressSpace() (platform.AddressSpace, error) {
-	return newSubprocess(globalPool.source.createStub, p.memoryFile, true)
+//
+// In mm.Fork, the child process's AddressSpace and MemoryManager must be
+// synchronized to ensure a consistent view of syscall patching. Even though a
+// concurrent ARCH_SET_GS may set mm.gsInUse just after reading it for
+// opts.DisableSyscallPatching, that is ok. The flag is only set once the
+// parent process's syscalls have already been unpatched, so the child process
+// will either:
+//   - see the flag before and inherit an unpatched address space.
+//   - miss it, unpatch completes, and inherit a clean address space with
+//     usertrap enabled.
+//
+// This is ok as the calling thread never set its own GS register. The child
+// process/thread inherits an accurate value with a completely patchable
+// address space.
+func (p *Systrap) NewAddressSpace(opts platform.AddressSpaceOptions) (platform.AddressSpace, error) {
+	return newSubprocess(globalPool.source.createStub, p.memoryFile, true /* usesSeccomNotify */, opts.DisableSyscallPatching)
 }
 
 // NewContext returns an interruptible platformContext.
@@ -403,18 +417,6 @@ type constructor struct{}
 
 func (*constructor) New(opts platform.Options) (platform.Platform, error) {
 	return New(opts)
-}
-
-func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
-	return nil, nil
-}
-
-// Requirements implements platform.Constructor.Requirements().
-func (*constructor) Requirements() platform.Requirements {
-	return platform.Requirements{
-		RequiresCapSysPtrace:      true,
-		FrequentHostThreadWakeups: true,
-	}
 }
 
 func init() {

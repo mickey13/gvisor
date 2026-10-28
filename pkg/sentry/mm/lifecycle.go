@@ -33,7 +33,7 @@ import (
 
 // NewMemoryManager returns a new MemoryManager with no mappings and 1 user.
 func NewMemoryManager(p platform.Platform, mf *pgalloc.MemoryFile) (*MemoryManager, error) {
-	as, err := p.NewAddressSpace()
+	as, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +114,14 @@ func (mm *MemoryManager) abortForkLocked(ctx context.Context, droppedIDs []memma
 // +checklocksexclude:mm.mappingMu
 // +checklocksexclude:mm.activeMu
 func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
-	as, err := mm.p.NewAddressSpace()
+	// Systrap cares about the GS register: see systrap.go/NewAddressSpace.
+	mm.activeMu.RLock()
+	gsInUse := mm.gsInUse
+	mm.activeMu.RUnlock()
+
+	as, err := mm.p.NewAddressSpace(platform.AddressSpaceOptions{
+		DisableSyscallPatching: gsInUse,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +162,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 		// IncRef'd below, once we know that there isn't an error.
 		executable:        mm.executable,
 		dumpability:       atomicbitops.FromInt32(mm.dumpability.Load()),
+		userNS:            mm.userNS,
 		aioManager:        aioManager{contexts: make(map[uint64]*AIOContext)},
 		vdsoSigReturnAddr: mm.vdsoSigReturnAddr,
 	}
@@ -212,6 +220,7 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 	defer mm.activeMu.Unlock()
 	mm2.activeMu.NestedLock(activeLockForked)
 	defer mm2.activeMu.NestedUnlock(activeLockForked)
+	mm2.gsInUse = gsInUse
 	if dontforks || mm.hasPinned {
 		defer mm.pmas.MergeInsideRange(mm.applicationAddrRange())
 	}
@@ -373,11 +382,12 @@ func (mm *MemoryManager) Fork(ctx context.Context) (*MemoryManager, error) {
 // +checklocks:mm.activeMu
 // +checklocks:mm2.activeMu
 func (mm *MemoryManager) forkCopyPMALocked(mm2 *MemoryManager, srcpseg pmaIterator, dstpgap pmaGapIterator, memCgID uint32) (pmaGapIterator, error) {
-	if err := srcpseg.getInternalMappingsLocked(); err != nil {
+	copyAR := srcpseg.Range()
+	ims, err := srcpseg.getInternalMappingsLocked(copyAR)
+	if err != nil {
 		return dstpgap, err
 	}
-	copyAR := srcpseg.Range()
-	reader := safemem.BlockSeqReader{Blocks: mm.internalMappingsLocked(srcpseg, copyAR)}
+	reader := safemem.BlockSeqReader{Blocks: ims}
 	huge := mm.mf.HugepagesEnabled() && copyAR.IsHugePageAligned()
 	fr, err := mm.mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
 		Kind:       usage.Anonymous,

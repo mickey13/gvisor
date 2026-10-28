@@ -61,6 +61,19 @@ var nameToID = map[string]stack.TableID{
 	rawTable:    stack.RawID,
 }
 
+// errTableNotFound is returned when a requested table doesn't exist.
+// It is translated to `ENOENT`.
+var errTableNotFound = errors.New("table not found")
+
+// tableLookupError converts an error from convertNetstackToBinary{4,6} into a
+// syserr.Error.
+func tableLookupError(err error) *syserr.Error {
+	if errors.Is(err, errTableNotFound) {
+		return syserr.ErrNoFileOrDir
+	}
+	return syserr.ErrInvalidArgument
+}
+
 // DefaultLinuxTables returns the rules of stack.DefaultTables() wrapped for
 // compatibility with netfilter extensions.
 func DefaultLinuxTables(clock tcpip.Clock, rand *rand.Rand) *stack.IPTables {
@@ -104,7 +117,7 @@ func GetInfo(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, ipv6 bool
 	}
 	if err != nil {
 		nflog("couldn't convert iptables: %v", err)
-		return linux.IPTGetinfo{}, syserr.ErrInvalidArgument
+		return linux.IPTGetinfo{}, tableLookupError(err)
 	}
 
 	nflog("returning info: %+v", info)
@@ -120,12 +133,16 @@ func GetEntries4(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		return linux.KernelIPTGetEntries{}, syserr.FromError(err)
 	}
 
+	if outLen != userEntries.SizeBytes()+int(userEntries.Size) {
+		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
+	}
+
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
 	entries, _, err := convertNetstackToBinary4(stack, userEntries.Name)
 	if err != nil {
 		nflog("couldn't read entries: %v", err)
-		return linux.KernelIPTGetEntries{}, syserr.ErrInvalidArgument
+		return linux.KernelIPTGetEntries{}, tableLookupError(err)
 	}
 	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
@@ -145,12 +162,16 @@ func GetEntries6(t *kernel.Task, stack *stack.Stack, outPtr hostarch.Addr, outLe
 		return linux.KernelIP6TGetEntries{}, syserr.FromError(err)
 	}
 
+	if outLen != userEntries.SizeBytes()+int(userEntries.Size) {
+		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
+	}
+
 	// Convert netstack's iptables rules to something that the iptables
 	// tool can understand.
 	entries, _, err := convertNetstackToBinary6(stack, userEntries.Name)
 	if err != nil {
 		nflog("couldn't read entries: %v", err)
-		return linux.KernelIP6TGetEntries{}, syserr.ErrInvalidArgument
+		return linux.KernelIP6TGetEntries{}, tableLookupError(err)
 	}
 	if entries.SizeBytes() > outLen {
 		nflog("insufficient GetEntries output size: %d", uintptr(outLen))
@@ -197,6 +218,8 @@ func SetEntries(mapper IDMapper, stk *stack.Stack, optVal []byte, ipv6 bool) *sy
 		table = stack.EmptyFilterTable()
 	case natTable:
 		table = stack.EmptyNATTable()
+	case mangleTable:
+		table = stack.EmptyMangleTable()
 	case rawTable:
 		table = stack.EmptyRawTable()
 	default:

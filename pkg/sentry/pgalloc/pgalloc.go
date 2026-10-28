@@ -45,7 +45,10 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
-const pagesPerHugePage = hostarch.HugePageSize / hostarch.PageSize
+// pagesPerHugePage returns the number of small pages in a huge page.
+func pagesPerHugePage() uint64 {
+	return uint64(hostarch.HugePageSize >> hostarch.PageShift)
+}
 
 // MemoryFile is a memmap.File whose pages may be allocated to arbitrary
 // users.
@@ -172,7 +175,7 @@ type MemoryFile struct {
 	knownCommittedBytes uint64
 	commitSeq           uint64
 	nextCommitScan      time.Time
-	ongoingCommitScan   atomic.Bool
+	ongoingCommitScan   atomicbitops.Bool
 	isSaving            bool
 
 	// evictable maps EvictableMemoryUsers to eviction state.
@@ -187,8 +190,8 @@ type MemoryFile struct {
 	opts MemoryFileOpts
 
 	// savable is true if this MemoryFile will be saved via SaveTo() during
-	// the kernel's SaveTo operation. savable is protected by mu.
-	savable bool
+	// the kernel's SaveTo operation.
+	savable atomicbitops.Bool
 
 	// destroyed is set by Destroy to instruct the releaser goroutine to
 	// release all MemoryFile resources and exit. destroyed is protected by mu.
@@ -360,7 +363,7 @@ type MemoryFileOpts struct {
 	DecommitOnDestroy bool
 
 	// If DisableIMAWorkAround is true, NewMemoryFile will not call
-	// IMAWorkAroundForMemFile().
+	// hostmm.IMAWorkAroundForMemFile().
 	DisableIMAWorkAround bool
 
 	// DiskBackedFile indicates that the MemoryFile is backed by a file on disk.
@@ -464,7 +467,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	go f.releaserMain() // S/R-SAFE: f.mu
 
 	if !opts.DisableIMAWorkAround {
-		IMAWorkAroundForMemFile(file.Fd())
+		hostmm.IMAWorkAroundForMemFile(file.Fd())
 	}
 	return f, nil
 }
@@ -481,41 +484,6 @@ func (f *MemoryFile) initFields() {
 	f.evictable = make(map[EvictableMemoryUser]*evictableMemoryUserInfo)
 	chunks := []chunkInfo(nil)
 	f.chunks.Store(&chunks)
-}
-
-// IMAWorkAroundForMemFile works around IMA by immediately creating a temporary
-// PROT_EXEC mapping, while the backing file is still small. IMA will ignore
-// any future mappings.
-//
-// The Linux kernel contains an optional feature called "Integrity
-// Measurement Architecture" (IMA). If IMA is enabled, it will checksum
-// binaries the first time they are mapped PROT_EXEC. This is bad news for
-// executable pages mapped from our backing file, which can grow to
-// terabytes in (sparse) size. If IMA attempts to checksum a file that
-// large, it will allocate all of the sparse pages and quickly exhaust all
-// memory.
-func IMAWorkAroundForMemFile(fd uintptr) {
-	m, _, errno := unix.Syscall6(
-		unix.SYS_MMAP,
-		0,
-		hostarch.PageSize,
-		unix.PROT_EXEC,
-		unix.MAP_SHARED,
-		fd,
-		0)
-	if errno != 0 {
-		// This isn't fatal (IMA may not even be in use). Log the error, but
-		// don't return it.
-		log.Warningf("Failed to pre-map MemoryFile PROT_EXEC: %v", errno)
-	} else {
-		if _, _, errno := unix.Syscall(
-			unix.SYS_MUNMAP,
-			m,
-			hostarch.PageSize,
-			0); errno != 0 {
-			panic(fmt.Sprintf("failed to unmap PROT_EXEC MemoryFile mapping: %v", errno))
-		}
-	}
 }
 
 // Destroy releases all resources used by f.
@@ -740,7 +708,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			} else if needHugeTouch {
 				// We only need to touch a single byte in each huge page.
 				f.forEachMappingSlice(fr, func(bs []byte) {
-					for i := 0; i < len(bs); i += hostarch.HugePageSize {
+					for i := 0; i < len(bs); i += int(hostarch.HugePageSize) {
 						bs[i] = 0
 					}
 				})
@@ -788,24 +756,9 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 		// Try to recycle waste pages, since this avoids the overhead of
 		// decommitting and then committing them again.
 		var uwgap unwasteGapIterator
-		if alloc.opts.Dir == BottomUp {
-			uwgap = unwaste.FirstLargeEnoughGap(alloc.length)
-		} else {
-			uwgap = unwaste.LastLargeEnoughGap(alloc.length)
-		}
+		uwgap, fr = findRecyclable(unwaste, alloc)
 		if uwgap.Ok() {
 			alloc.recycled = true
-			if alloc.opts.Dir == BottomUp {
-				fr = memmap.FileRange{
-					Start: uwgap.Start(),
-					End:   uwgap.Start() + alloc.length,
-				}
-			} else {
-				fr = memmap.FileRange{
-					Start: uwgap.End() - alloc.length,
-					End:   uwgap.End(),
-				}
-			}
 			unwaste.Insert(uwgap, fr, unwasteInfo{})
 			// Update reference count for these pages from 0 to 1.
 			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
@@ -843,15 +796,6 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 	}
 
 	// No suitable waste pages or we can't use them.
-	// If there is waste memory waiting to be released and we have a backing
-	// file, perform direct reclaim on a waste chunk before allocating new free
-	// memory. This throttles allocating threads when the background releaser
-	// is falling behind and prevents unreleased waste memory from accumulating
-	// and triggering host OOM kills.
-	if f.file != nil && f.haveWaste && !f.opts.DisableMemoryAccounting {
-		f.releaseWasteChunkLocked()
-	}
-
 retryFree:
 	// Try to allocate free pages from existing chunks.
 	var ufgap unfreeGapIterator
@@ -861,14 +805,6 @@ retryFree:
 		ufgap = unfree.LastLargeEnoughGap(alloc.length)
 	}
 	if !ufgap.Ok() {
-		// If no free gap is large enough to satisfy this allocation, release
-		// any pending waste memory before extending the file. Releasing a
-		// waste chunk decommits it and removes it from unfree, where it can
-		// coalesce with adjacent free gaps to form a larger contiguous free
-		// region that satisfies alloc.length without expanding the file.
-		if f.file != nil && f.haveWaste && f.releaseWasteChunkLocked() {
-			goto retryFree
-		}
 		// Extend the file to create more chunks.
 		err = f.extendChunksLocked(alloc)
 		if err != nil {
@@ -904,6 +840,65 @@ retryFree:
 		commitSeq:      f.commitSeq,
 	})
 	return
+}
+
+// findRecyclable returns a gap in unwaste that is large enough for alloc, and
+// the range within it that alloc should recycle. Huge allocations must be
+// hugepage-aligned to be backed by huge pages, but waste is only page-aligned,
+// so if the first large enough gap can't fit an aligned range, a gap large
+// enough to contain one is used instead.
+func findRecyclable(unwaste *unwasteSet, alloc *allocState) (unwasteGapIterator, memmap.FileRange) {
+	uwgap := largeEnoughGap(unwaste, alloc, alloc.length)
+	if !uwgap.Ok() {
+		return uwgap, memmap.FileRange{}
+	}
+	fr, ok := recycleRange(uwgap, alloc)
+	if !ok && alloc.huge {
+		// A gap this large always contains a hugepage-aligned range of
+		// alloc.length bytes.
+		minSize := alloc.length + uint64(hostarch.HugePageSize) - uint64(hostarch.PageSize)
+		if minSize < alloc.length { // overflow
+			return unwasteGapIterator{}, memmap.FileRange{}
+		}
+		if uwgap = largeEnoughGap(unwaste, alloc, minSize); !uwgap.Ok() {
+			return uwgap, memmap.FileRange{}
+		}
+		fr, ok = recycleRange(uwgap, alloc)
+	}
+	if !ok {
+		return unwasteGapIterator{}, memmap.FileRange{}
+	}
+	return uwgap, fr
+}
+
+func largeEnoughGap(unwaste *unwasteSet, alloc *allocState, minSize uint64) unwasteGapIterator {
+	if alloc.opts.Dir == BottomUp {
+		return unwaste.FirstLargeEnoughGap(minSize)
+	}
+	return unwaste.LastLargeEnoughGap(minSize)
+}
+
+// recycleRange returns the range in uwgap that alloc should recycle, and
+// whether uwgap can fit it.
+func recycleRange(uwgap unwasteGapIterator, alloc *allocState) (memmap.FileRange, bool) {
+	var fr memmap.FileRange
+	if alloc.opts.Dir == BottomUp {
+		fr.Start = uwgap.Start()
+		if alloc.huge {
+			var ok bool
+			if fr.Start, ok = hostarch.HugePageRoundUp(fr.Start); !ok {
+				return fr, false
+			}
+		}
+		fr.End = fr.Start + alloc.length
+	} else {
+		fr.End = uwgap.End()
+		if alloc.huge {
+			fr.End = hostarch.HugePageRoundDown(fr.End)
+		}
+		fr.Start = fr.End - alloc.length
+	}
+	return fr, uwgap.Range().IsSupersetOf(fr)
 }
 
 // Preconditions: f.mu must be locked.
@@ -1017,7 +1012,7 @@ func tryPopulateMadv(b safemem.Block) bool {
 	// Only call madvise(MADV_POPULATE_WRITE) if >=2 pages are being populated.
 	// 1 syscall overhead >= 1 page fault overhead. This is because syscalls are
 	// susceptible to additional overheads like seccomp-bpf filters and auditing.
-	if b.Len() <= hostarch.PageSize {
+	if b.Len() <= int(hostarch.PageSize) {
 		return true
 	}
 	_, _, errno := unix.Syscall(unix.SYS_MADVISE, b.Addr(), uintptr(b.Len()), unix.MADV_POPULATE_WRITE)
@@ -1100,7 +1095,7 @@ func tryPopulate(b safemem.Block) bool {
 //   - fr.Length() > 0.
 //   - At least one reference must be held on all pages in fr.
 func (f *MemoryFile) Decommit(fr memmap.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsPageAligned(fr.Start) || !hostarch.IsPageAligned(fr.End) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -1314,64 +1309,54 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 	}
 }
 
-// releaseWasteChunkLocked finds and releases up to maxReleasingBytes of waste
-// memory. It returns true if a waste chunk was found and released.
-//
-// Preconditions: f.mu must be locked; it may be unlocked and reacquired.
-func (f *MemoryFile) releaseWasteChunkLocked() bool {
-	// Huge pages are relatively rare and expensive due to fragmentation
-	// and the cost of compaction. Fragmentation is expected to increase
-	// over time. Most allocations are done upwards, with the main
-	// exception being thread stacks. So we expect lower offsets to weakly
-	// correlate with older allocations, which are more likely to actually
-	// be hugepage-backed. Thus, release from unwasteSmall before
-	// unwasteHuge, and higher offsets before lower ones.
-	for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge} {
-		if uwgap := unwaste.LastLargeEnoughGap(1); uwgap.Ok() {
-			fr := uwgap.Range()
-			// Linux serializes fallocate()s on shmem files, so limit the amount we
-			// release at once to avoid starving Decommit().
-			const maxReleasingBytes = 128 << 20 // 128 MB
-			if fr.Length() > maxReleasingBytes {
-				fr.Start = fr.End - maxReleasingBytes
-			}
-			unwaste.Insert(uwgap, fr, unwasteInfo{})
-			f.releaseLocked(fr, i == 1)
-			if !f.unwasteSmall.LastLargeEnoughGap(1).Ok() && !f.unwasteHuge.LastLargeEnoughGap(1).Ok() {
-				f.haveWaste = false
-			}
-			return true
-		}
-	}
-	f.haveWaste = false
-	return false
-}
-
 // releaserMain implements the releaser goroutine.
 func (f *MemoryFile) releaserMain() {
 	f.mu.Lock()
+MainLoop:
 	for {
-		if f.destroyed {
-			f.releaserDestroyLocked()
-			f.mu.Unlock()
-			// This must be called without holding f.mu to avoid circular lock
-			// ordering.
-			if f.stopNotifyPressure != nil {
-				f.stopNotifyPressure()
+		for {
+			if f.destroyed {
+				f.releaserDestroyLocked()
+				f.mu.Unlock()
+				// This must be called without holding f.mu to avoid circular lock
+				// ordering.
+				if f.stopNotifyPressure != nil {
+					f.stopNotifyPressure()
+				}
+				return
 			}
-			return
+			if f.haveWaste {
+				break
+			}
+			if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
+				// No work to do. Evict any pending evictable allocations to
+				// get more waste pages before going to sleep.
+				f.startEvictionsLocked()
+			}
+			f.releaseCond.Wait() // releases f.mu while waiting
 		}
-		if f.haveWaste {
-			if f.releaseWasteChunkLocked() {
-				continue
+		// Huge pages are relatively rare and expensive due to fragmentation
+		// and the cost of compaction. Fragmentation is expected to increase
+		// over time. Most allocations are done upwards, with the main
+		// exception being thread stacks. So we expect lower offsets to weakly
+		// correlate with older allocations, which are more likely to actually
+		// be hugepage-backed. Thus, release from unwasteSmall before
+		// unwasteHuge, and higher offsets before lower ones.
+		for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge} {
+			if uwgap := unwaste.LastLargeEnoughGap(1); uwgap.Ok() {
+				fr := uwgap.Range()
+				// Linux serializes fallocate()s on shmem files, so limit the amount we
+				// release at once to avoid starving Decommit().
+				const maxReleasingBytes = 128 << 20 // 128 MB
+				if fr.Length() > maxReleasingBytes {
+					fr.Start = fr.End - maxReleasingBytes
+				}
+				unwaste.Insert(uwgap, fr, unwasteInfo{})
+				f.releaseLocked(fr, i == 1)
+				continue MainLoop
 			}
 		}
-		if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
-			// No work to do. Evict any pending evictable allocations to
-			// get more waste pages before going to sleep.
-			f.startEvictionsLocked()
-		}
-		f.releaseCond.Wait() // releases f.mu while waiting
+		f.haveWaste = false
 	}
 }
 
@@ -1410,14 +1395,14 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 
 	firstHugeStart := hostarch.HugePageRoundDown(fr.Start)
 	lastHugeStart := hostarch.HugePageRoundDown(fr.End - 1)
-	firstHugeEnd := firstHugeStart + hostarch.HugePageSize
-	lastHugeEnd := lastHugeStart + hostarch.HugePageSize
+	firstHugeEnd := firstHugeStart + uint64(hostarch.HugePageSize)
+	lastHugeEnd := lastHugeStart + uint64(hostarch.HugePageSize)
 	if firstHugeStart == lastHugeStart {
 		// All of fr falls within a single huge page.
 		oldSubrel := f.subreleased[firstHugeStart]
-		incSubrel := fr.Length() / hostarch.PageSize
+		incSubrel := fr.Length() >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			// Free this huge page.
 			//
 			// When a small page within a hugepage-backed allocation is
@@ -1461,9 +1446,9 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 		freeFR.Start = firstHugeStart
 	} else {
 		oldSubrel := f.subreleased[firstHugeStart]
-		incSubrel := (firstHugeEnd - fr.Start) / hostarch.PageSize
+		incSubrel := (firstHugeEnd - fr.Start) >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			if oldSubrel != 0 {
 				delete(f.subreleased, firstHugeStart)
 			}
@@ -1479,9 +1464,9 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 		freeFR.End = lastHugeEnd
 	} else {
 		oldSubrel := f.subreleased[lastHugeStart]
-		incSubrel := (fr.End - lastHugeStart) / hostarch.PageSize
+		incSubrel := (fr.End - lastHugeStart) >> hostarch.PageShift
 		newSubrel := oldSubrel + incSubrel
-		if newSubrel == pagesPerHugePage {
+		if newSubrel == pagesPerHugePage() {
 			if oldSubrel != 0 {
 				delete(f.subreleased, lastHugeStart)
 			}
@@ -1701,10 +1686,11 @@ func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 // Precondition: f.mu must be held; it may be unlocked and reacquired.
 // +checklocks:f.mu
 func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
-	// Track if anything changed to elide the merge.
+	// Track if anything changed to elide the merge. f.SaveTo() holds an
+	// iterator into f.memAcct across f.mu unlocks, so don't merge while saving.
 	changedAny := false
 	defer func() {
-		if changedAny {
+		if changedAny && !f.isSaving {
 			f.memAcct.MergeAll()
 		}
 	}()
@@ -1753,7 +1739,7 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 
 			// Ensure that we have sufficient buffer for the call (one byte per
 			// page). The length of s must be page-aligned.
-			bufLen := len(s) / hostarch.PageSize
+			bufLen := len(s) >> hostarch.PageShift
 			if len(buf) < bufLen {
 				buf = make([]byte, bufLen)
 			}
@@ -1794,8 +1780,8 @@ func (f *MemoryFile) updateUsageLocked(memCgIDs map[uint32]struct{}) error {
 					}
 				}
 				commitFR := memmap.FileRange{
-					Start: chunkFR.Start + uint64(i*hostarch.PageSize),
-					End:   chunkFR.Start + uint64(j*hostarch.PageSize),
+					Start: chunkFR.Start + uint64(i)<<hostarch.PageShift,
+					End:   chunkFR.Start + uint64(j)<<hostarch.PageShift,
 				}
 				// Advance maseg to commitFR.Start.
 				for maseg.Ok() && maseg.End() <= commitFR.Start {

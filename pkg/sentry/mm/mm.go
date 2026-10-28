@@ -43,6 +43,7 @@ import (
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -167,6 +168,13 @@ type MemoryManager struct {
 	// +checklocks:activeMu
 	hasPinned bool
 
+	// gsInUse is true if the application uses the GS register. Only Systrap
+	// cares about this, but it must be defined in mm to preserve the flag
+	// across save/restores.
+	//
+	// gsInUse is protected by activeMu.
+	gsInUse bool
+
 	// as is the platform.AddressSpace that pmas are mapped into. as is immutable
 	// until users becomes 0, at which point as becomes nil. Reads with a live
 	// user reference need no lock. activeMu serializes teardown and invalidation
@@ -194,6 +202,13 @@ type MemoryManager struct {
 	//
 	// +checkatomic
 	dumpability atomicbitops.Int32
+
+	// userNS is Linux's mm_struct::user_ns: the user namespace in which
+	// CAP_SYS_PTRACE grants access to this MemoryManager when it is not
+	// dumpable. It is set by the loader before the MemoryManager becomes
+	// visible to other tasks (and preserved across save/restore), and is
+	// immutable thereafter.
+	userNS *auth.UserNamespace
 
 	metadataMu metadataMutex `state:"nosave"`
 

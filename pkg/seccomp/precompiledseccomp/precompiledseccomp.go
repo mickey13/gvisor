@@ -215,9 +215,19 @@ func Precompile(name string, varNames []string, fn func(Values) *seccomp.Program
 	return program1, nil
 }
 
+// optimizedRules memoizes rule optimization across all precompiled programs,
+// which share most of their rules.
+var optimizedRules seccomp.OptimizedRuleCache
+
 // precompile compiles a `seccomp.Program` with the given values.
 func precompile(name string, values Values, fn func(Values) *seccomp.Program) (Program, error) {
 	prog := fn(values)
+	if prog.Options.RuleCache == nil {
+		prog.Options.RuleCache = &optimizedRules
+	}
+	if err := checkSyscallVarsPrecompilable(prog, values); err != nil {
+		return Program{}, err
+	}
 	insns, _, err := prog.Build()
 	if err != nil {
 		return Program{}, err
@@ -336,6 +346,9 @@ func (program Program) Expr(indentPrefix, pkgName string) string {
 func (program Program) RenderInstructions(values Values) ([]bpf.Instruction, error) {
 	if len(values) != len(program.VarOffsets) {
 		return nil, fmt.Errorf("called with inconsistent vars: got %v expected %v", values, program.VarOffsets)
+	}
+	if err := values.checkSyscallVarsRenderable(); err != nil {
+		return nil, err
 	}
 	for varName, value := range values {
 		offsets, found := program.VarOffsets[varName]

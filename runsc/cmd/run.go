@@ -82,7 +82,7 @@ func (r *Run) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Sp
 	if r.bundleDir == "" {
 		r.bundleDir = getwdOrDie()
 	}
-	spec, err := specutils.ReadSpec(r.bundleDir, conf)
+	spec, err := specutils.ReadSpec(r.bundleDir, specutils.SpecOpts{Conf: conf, NoRootContainer: r.noRootContainer})
 	if err != nil {
 		return "", nil, fmt.Errorf("reading spec: %w", err)
 	}
@@ -117,8 +117,10 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 	}
 	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
-	if err := validateProcessSpec(spec.Process); err != nil {
-		return util.Errorf("invalid process spec: %v", err)
+	if !r.noRootContainer {
+		if err := validateProcessSpec(spec.Process); err != nil {
+			return util.Errorf("invalid process spec: %v", err)
+		}
 	}
 
 	fdMap, closeFiles, err := r.passFiles()
@@ -140,17 +142,18 @@ func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomman
 	}()
 
 	runArgs := container.Args{
-		ID:                 id,
-		Spec:               spec,
-		BundleDir:          r.bundleDir,
-		ConsoleSocket:      r.consoleSocket,
-		PIDFile:            r.pidFile,
-		UserLog:            r.userLog,
-		Attached:           !r.detach,
-		PassFiles:          fdMap,
-		ExecFile:           execFile,
-		FSRestoreImagePath: r.fsRestoreImagePath,
-		FSRestoreDirect:    r.fsRestoreDirect,
+		ID:                  id,
+		Spec:                spec,
+		BundleDir:           r.bundleDir,
+		ConsoleSocket:       r.consoleSocket,
+		PIDFile:             r.pidFile,
+		UserLog:             r.userLog,
+		Attached:            !r.detach,
+		PassFiles:           fdMap,
+		ExecFile:            execFile,
+		FSRestoreImagePaths: []string(r.fsRestoreImagePaths),
+		FSRestoreDirect:     r.fsRestoreDirect,
+		NoRootContainer:     r.noRootContainer,
 	}
 	ws, err := container.Run(conf, runArgs)
 	if err != nil {

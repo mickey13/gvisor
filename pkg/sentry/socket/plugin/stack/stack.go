@@ -21,6 +21,7 @@ package stack
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/socket/plugin"
@@ -50,11 +51,6 @@ func (s *Stack) Init(args *plugin.InitStackArgs) error {
 	return nil
 }
 
-// PreInit implements plugin.PluginStack.PreInit.
-func (s *Stack) PreInit(args *plugin.PreInitStackArgs) (string, []int, error) {
-	return cgo.PreInitStack(args.Pid)
-}
-
 // Interfaces implements inet.Stack.Interfaces.
 func (s *Stack) Interfaces() map[int32]inet.Interface {
 	// TODO: support Interfaces
@@ -74,12 +70,12 @@ func (s *Stack) InterfaceIDs() []int32 {
 }
 
 // AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+func (s *Stack) AddInterfaceAddr(ctx context.Context, idx int32, addr inet.InterfaceAddr) error {
 	return linuxerr.EACCES
 }
 
 // RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
-func (s *Stack) RemoveInterfaceAddr(int32, inet.InterfaceAddr) error {
+func (s *Stack) RemoveInterfaceAddr(context.Context, int32, inet.InterfaceAddr) error {
 	return linuxerr.EACCES
 }
 

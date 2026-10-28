@@ -172,6 +172,10 @@ type PacketBuffer struct {
 	// Mark is the mark value of this packet.
 	Mark uint32
 
+	// icmpEchoReply replies to an ICMP Echo Request using the stack's built-in
+	// Echo Reply path.
+	icmpEchoReply *icmpEchoReplyHook `state:"nosave"`
+
 	tuple *tuple
 
 	// onRelease is a function to be run when the packet buffer is no longer
@@ -409,6 +413,71 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	return newPk
 }
 
+type icmpEchoReplyHook struct {
+	mu      sync.Mutex
+	active  bool
+	replied bool
+	reply   func() bool
+}
+
+// SetICMPEchoReply sets the built-in ICMP Echo Reply hook for an ICMP Echo
+// Request packet. SetICMPEchoReply is a cross-package bridge for ICMP network
+// endpoint reply paths; ICMP forwarder users should call the forwarder
+// request's Reply method instead.
+func (pk *PacketBuffer) SetICMPEchoReply(reply func() bool) {
+	pk.icmpEchoReply = &icmpEchoReplyHook{
+		active: true,
+		reply:  reply,
+	}
+}
+
+// ClearICMPEchoReply clears the built-in ICMP Echo Reply hook. It is paired
+// with SetICMPEchoReply by ICMP network endpoint reply paths.
+func (pk *PacketBuffer) ClearICMPEchoReply() {
+	if hook := pk.icmpEchoReply; hook != nil {
+		hook.deactivate()
+	}
+	pk.icmpEchoReply = nil
+}
+
+// ReplyICMPEcho asks the stack to synthesize its built-in ICMP Echo Reply for
+// pkt. ReplyICMPEcho is a cross-package bridge for the ICMP forwarder; ICMP
+// forwarder users should call the forwarder request's Reply method instead.
+// ReplyICMPEcho is idempotent and returns false if pkt has no active built-in
+// reply path. A true return value does not guarantee that the reply packet was
+// delivered.
+func ReplyICMPEcho(pkt *PacketBuffer) bool {
+	if pkt == nil {
+		return false
+	}
+	if hook := pkt.icmpEchoReply; hook != nil {
+		return hook.replyOnce()
+	}
+	return false
+}
+
+func (h *icmpEchoReplyHook) replyOnce() bool {
+	h.mu.Lock()
+	if !h.active {
+		h.mu.Unlock()
+		return false
+	}
+	if h.replied {
+		h.mu.Unlock()
+		return true
+	}
+	h.replied = true
+	reply := h.reply
+	h.mu.Unlock()
+	return reply()
+}
+
+func (h *icmpEchoReplyHook) deactivate() {
+	h.mu.Lock()
+	h.active = false
+	h.mu.Unlock()
+}
+
 // ReserveHeaderBytes prepends reserved space for headers at the front
 // of the underlying buf. Can only be called once per packet.
 func (pk *PacketBuffer) ReserveHeaderBytes(reserved int) {
@@ -516,6 +585,15 @@ func (pk *PacketBuffer) IsNATConfigured(nt NATType) bool {
 		return false
 	}
 	return pk.tuple.conn.IsNATConfigured(nt)
+}
+
+// IsNATApplied returns whether NAT of the given type changed the addresses or
+// ports of this packet's connection.
+func (pk *PacketBuffer) IsNATApplied(nt NATType) bool {
+	if !pk.IsConnTrackConfigured() {
+		return false
+	}
+	return pk.tuple.conn.IsNATApplied(nt)
 }
 
 // ConfigureNoopNAT configures a no-op NAT for the packet.
@@ -1133,23 +1211,23 @@ func (pk *PacketBuffer) CalculateTransportChecksum() {
 		}
 	}
 
+	// The IPv6 base header may identify an extension header. Use the matched
+	// transport protocol for the pseudoheader instead.
 	var xsum uint16
 	switch t := transHdr.(type) {
 	case header.TCP:
 		src := netHdr.SourceAddress()
 		dst := netHdr.DestinationAddress()
-		proto := netHdr.TransportProtocol()
 		totalLen := uint16(len(t) + pk.Data().Size())
-		xsum = header.PseudoHeaderChecksum(proto, src, dst, totalLen)
+		xsum = header.PseudoHeaderChecksum(header.TCPProtocolNumber, src, dst, totalLen)
 		xsum = checksum.Combine(xsum, pk.Data().Checksum())
 		t.SetChecksum(0)
 		t.SetChecksum(^t.CalculateChecksum(xsum))
 	case header.UDP:
 		src := netHdr.SourceAddress()
 		dst := netHdr.DestinationAddress()
-		proto := netHdr.TransportProtocol()
 		totalLen := uint16(len(t) + pk.Data().Size())
-		xsum = header.PseudoHeaderChecksum(proto, src, dst, totalLen)
+		xsum = header.PseudoHeaderChecksum(header.UDPProtocolNumber, src, dst, totalLen)
 		xsum = checksum.Combine(xsum, pk.Data().Checksum())
 		t.SetChecksum(0)
 		csum := ^t.CalculateChecksum(xsum)

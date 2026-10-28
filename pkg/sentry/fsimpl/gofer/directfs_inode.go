@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/cleanup"
@@ -149,8 +148,12 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 	// This also avoids a correctness issue when a directory is bind-mounted on the host:
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
+	var cacheHit bool
 	temp.d.inode = fs.getOrCreateInode(inoKey /* dontCache = */, isDir,
-		func() { _ = unix.Close(controlFD) },
+		func() {
+			cacheHit = true
+			_ = unix.Close(controlFD)
+		},
 		func() *inode {
 			temp.i = directfsInode{
 				inode: inode{
@@ -162,7 +165,7 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 					mode:      atomicbitops.FromUint32(uint32(stat.Mode)),
 					uid:       atomicbitops.FromUint32(uint32(fs.opts.dfltuid)),
 					gid:       atomicbitops.FromUint32(uint32(fs.opts.dfltgid)),
-					blockSize: atomicbitops.FromUint32(hostarch.PageSize),
+					blockSize: atomicbitops.FromUint32(uint32(hostarch.PageSize)),
 					readFD:    atomicbitops.FromInt32(-1),
 					writeFD:   atomicbitops.FromInt32(-1),
 					mmapFD:    atomicbitops.FromInt32(-1),
@@ -214,6 +217,12 @@ func (fs *filesystem) newDirectfsDentry(controlFD int) (*dentry, error) {
 			}
 			return inode
 		})
+	if cacheHit && !temp.d.inode.cachedMetadataAuthoritative() {
+		i := temp.d.inode.impl.(*directfsInode)
+		i.metadataMu.Lock()
+		i.updateMetadataFromStatxLocked(&stat)
+		i.metadataMu.Unlock()
+	}
 
 	temp.d.init()
 	// If this dentry adopted a cached inode that already carries a bound-socket
@@ -327,6 +336,11 @@ func (i *directfsInode) ensureLisafsControlFD(ctx context.Context, d *dentry) er
 		log.Warningf("intermediate path component was a symlink? names = %v, inodes = %+v", names, inodes)
 		return unix.ELOOP
 	case lisafs.WalkSuccess:
+		// Verify that the walk found the same file
+		if stat := &inodes[last].Stat; inoKeyFromStatx(stat) != i.inoKey || uint32(stat.Mode)&unix.S_IFMT != i.inode.fileType() {
+			d.inode.fs.client.CloseFD(ctx, inodes[last].ControlFD, true /* flush */)
+			return unix.ESTALE
+		}
 		i.controlFDLisa = d.inode.fs.client.NewFD(inodes[last].ControlFD)
 		return nil
 	}
@@ -414,7 +428,8 @@ func (i *directfsInode) updateMetadataFromStatxLocked(stat *unix.Statx_t) {
 	}
 }
 
-// Precondition: fs.renameMu is locked if d is a socket.
+// Precondition: if d is a socket, then fs.renameMu is locked and
+// i.controlFDLisa has been initialized.
 func (i *directfsInode) chmod(ctx context.Context, mode uint16, d *dentry) error {
 	if i.isSymlink() {
 		// Linux does not support changing the mode of symlinks. See
@@ -426,14 +441,10 @@ func (i *directfsInode) chmod(ctx context.Context, mode uint16, d *dentry) error
 	}
 
 	// Sockets use O_PATH control FDs. However, fchmod(2) fails with EBADF for
-	// O_PATH FDs. Try to fchmodat(2) it from its parent.
-	if parent := d.parent.Load(); parent != nil {
-		return unix.Fchmodat(parent.inode.impl.(*directfsInode).controlFD, d.name, uint32(mode), 0 /* flags */)
-	}
-
-	// This is a mount point socket (no parent). Fallback to using lisafs.
-	if err := i.ensureLisafsControlFD(ctx, d); err != nil {
-		return err
+	// O_PATH FDs. Fallback to lisafs.
+	if !i.controlFDLisa.Ok() {
+		log.Warningf("lisafs control FD not available to chmod socket %q", genericDebugPathname(i.fs, d))
+		return unix.EIO
 	}
 	return chmod(ctx, i.controlFDLisa, mode)
 }
@@ -497,6 +508,13 @@ func (i *directfsInode) utimensat(ctx context.Context, stat *linux.Statx, d *den
 
 // Precondition: fs.renameMu is locked.
 func (i *directfsInode) prepareSetStat(ctx context.Context, stat *linux.Statx, d *dentry) error {
+	if stat.Mask&unix.STATX_MODE != 0 && i.isSocket() {
+		// chmod() on sockets requires a lisafs control FD. Acquire it here
+		// before taking i.handleMu.
+		if err := i.ensureLisafsControlFD(ctx, d); err != nil {
+			return err
+		}
+	}
 	if stat.Mask&unix.STATX_SIZE != 0 ||
 		(stat.Mask&(unix.STATX_ATIME|unix.STATX_MTIME) != 0 && i.isRegularFile()) {
 		// Need to ensure a writable FD is available. See setStatLocked() to
@@ -746,7 +764,7 @@ func (i *directfsInode) mknod(ctx context.Context, name string, creds *auth.Cred
 	if err := unix.Mknodat(i.controlFD, name, uint32(opts.Mode), 0); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.EffectiveKUID, creds.EffectiveKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
 }
 
 // Precondition: opts.Endpoint != nil and is transport.HostBoundEndpoint type.
@@ -757,7 +775,7 @@ func (i *directfsInode) bindAt(ctx context.Context, name string, creds *auth.Cre
 		return nil, err
 	}
 	sockType := opts.Endpoint.(transport.Endpoint).Type()
-	childInode, boundSocketFD, err := i.controlFDLisa.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.EffectiveKUID), lisafs.GID(creds.EffectiveKGID))
+	childInode, boundSocketFD, err := i.controlFDLisa.BindAt(ctx, sockType, name, opts.Mode, lisafs.UID(creds.FilesystemKUID), lisafs.GID(creds.FilesystemKGID))
 	if err != nil {
 		return nil, err
 	}
@@ -811,7 +829,7 @@ func (i *directfsInode) symlink(name, target string, creds *auth.Credentials, d 
 	if err := unix.Symlinkat(target, i.controlFD, name); err != nil {
 		return nil, err
 	}
-	return i.getCreatedChild(name, creds.EffectiveKUID, creds.EffectiveKGID, false /* isDir */, true /* createDentry */, d)
+	return i.getCreatedChild(name, creds.FilesystemKUID, creds.FilesystemKGID, false /* isDir */, true /* createDentry */, d)
 }
 
 func (i *directfsInode) openCreate(name string, accessFlags uint32, mode linux.FileMode, uid auth.KUID, gid auth.KGID, createDentry bool, d *dentry) (*dentry, handle, error) {
@@ -849,13 +867,13 @@ func (i *directfsInode) getDirentsLocked(recordDirent func(name string, key inoK
 }
 
 // Precondition: fs.renameMu is locked.
-func (i *directfsInode) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID, d *dentry) (int, error) {
+func (i *directfsInode) connect(ctx context.Context, sockType linux.SockType, euid lisafs.UID, egid lisafs.GID, groups []lisafs.GID, d *dentry) (int, error) {
 	// There are no filesystems mounted in the sandbox process's mount namespace.
 	// So we can't perform absolute path traversals. So fallback to using lisafs.
 	if err := i.ensureLisafsControlFD(ctx, d); err != nil {
 		return -1, err
 	}
-	return i.controlFDLisa.Connect(ctx, sockType, euid, egid)
+	return i.controlFDLisa.Connect(ctx, sockType, euid, egid, groups)
 }
 
 func (i *directfsInode) readlink() (string, error) {
@@ -1011,4 +1029,4 @@ func checkSupportedFileType(mode uint32) error {
 	}
 }
 
-// LINT.ThenChange(../../../../runsc/fsgofer/lisafs.go)
+// LINT.ThenChange(../../../../runsc/gofer/fs/lisafs.go)

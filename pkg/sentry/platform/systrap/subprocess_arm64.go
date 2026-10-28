@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
-	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform/systrap/sysmsg"
 )
@@ -160,12 +159,6 @@ func maybePatchSignalInfo(regs *arch.Registers, signalInfo *linux.SignalInfo) (p
 func enableCpuidFault() {
 }
 
-// appendArchSeccompRules append architecture specific seccomp rules when creating BPF program.
-// Ref attachedThread() for more detail.
-func appendArchSeccompRules(rules []seccomp.RuleSet) []seccomp.RuleSet {
-	return rules
-}
-
 // probeSeccomp returns true if seccomp is run after ptrace notifications,
 // which is generally the case for kernel version >= 4.8.
 //
@@ -194,7 +187,10 @@ func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
 		}
 
 		// Wait for the syscall-enter stop.
-		sig := t.wait(stopped)
+		sig, err := t.wait(stopped)
+		if err != nil {
+			t.dumpAndPanic(fmt.Sprintf("wait failed: %v", err))
+		}
 		if sig == unix.SIGSTOP {
 			// SIGSTOP was delivered to another thread in the same thread
 			// group, which initiated another group stop. Just ignore it.
@@ -210,14 +206,14 @@ func (s *subprocess) arm64SyscallWorkaround(t *thread, regs *arch.Registers) {
 	}
 }
 
-func restoreArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
+func (s *subprocess) restoreArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 	ctx.TLS = uint64(ac.TLS())
 }
 
 func setArchSpecificRegs(sysThread *sysmsgThread, regs *arch.Registers) {
 }
 
-func retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
+func (s *subprocess) retrieveArchSpecificState(ctx *sysmsg.ThreadContext, ac *arch.Context64) {
 	if !ac.SetTLS(uintptr(ctx.TLS)) {
 		panic(fmt.Sprintf("ac.SetTLS(%+v) failed", ctx.TLS))
 	}
